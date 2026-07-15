@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 
 	"github.com/pkg/errors"
@@ -57,6 +58,7 @@ type Manager struct {
 	bundleNamespaceMappingCache fleetcontrollers.BundleNamespaceMappingCache
 	namespaceCache              corecontrollers.NamespaceCache
 	contentStore                manifest.Store
+	selectorCache               sync.Map
 }
 
 func New(
@@ -120,11 +122,19 @@ func (m *Manager) clusterGroupsForCluster(cluster *fleet.Cluster) (result []*fle
 		if cg.Spec.Selector == nil {
 			continue
 		}
-		sel, err := metav1.LabelSelectorAsSelector(cg.Spec.Selector)
-		if err != nil {
-			logrus.Errorf("invalid selector on clusterGroup %s/%s [%v]: %v", cg.Namespace, cg.Name,
-				cg.Spec.Selector, err)
-			continue
+		// Cache key includes ResourceVersion so the selector is recompiled when the ClusterGroup changes.
+		cacheKey := cg.Namespace + "/" + cg.Name + "@" + cg.ResourceVersion
+		var sel labels.Selector
+		if cached, ok := m.selectorCache.Load(cacheKey); ok {
+			sel = cached.(labels.Selector)
+		} else {
+			sel, err = metav1.LabelSelectorAsSelector(cg.Spec.Selector)
+			if err != nil {
+				logrus.Errorf("invalid selector on clusterGroup %s/%s [%v]: %v", cg.Namespace, cg.Name,
+					cg.Spec.Selector, err)
+				continue
+			}
+			m.selectorCache.Store(cacheKey, sel)
 		}
 		if sel.Matches(labels.Set(cluster.Labels)) {
 			result = append(result, cg)

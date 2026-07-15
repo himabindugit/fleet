@@ -10,6 +10,7 @@ import (
 	"github.com/rancher/wrangler/v2/pkg/yaml"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 )
@@ -560,4 +561,262 @@ func TestGetBundleDeploymentForBundleInCluster(t *testing.T) {
 			assert.Equal(t, tc.expectedBundleDeployments, result)
 		})
 	}
+}
+
+func newManagerWithClusterGroupCache(t *testing.T, ctrl *gomock.Controller, cgCache *fake.MockCacheInterface[*v1alpha1.ClusterGroup]) *Manager {
+	t.Helper()
+	mockBDCache := fake.NewMockCacheInterface[*v1alpha1.BundleDeployment](ctrl)
+	mockBDCache.EXPECT().AddIndexer(byBundleIndexerName, gomock.Any())
+	return New(nil, cgCache, nil, nil, nil, nil, mockBDCache)
+}
+
+func TestClusterGroupsForCluster_Matching(t *testing.T) {
+	makeCG := func(name, rv string, selector *metav1.LabelSelector) *v1alpha1.ClusterGroup {
+		return &v1alpha1.ClusterGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Namespace:       "fleet-default",
+				ResourceVersion: rv,
+			},
+			Spec: v1alpha1.ClusterGroupSpec{
+				Selector: selector,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name          string
+		cgs           []*v1alpha1.ClusterGroup
+		clusterLabels map[string]string
+		listError     error
+		expectedNames []string
+		wantError     bool
+	}{
+		{
+			name: "matching cluster group returned",
+			cgs: []*v1alpha1.ClusterGroup{
+				makeCG("prod-cg", "1", &metav1.LabelSelector{
+					MatchLabels: map[string]string{"env": "prod"},
+				}),
+			},
+			clusterLabels: map[string]string{"env": "prod"},
+			expectedNames: []string{"prod-cg"},
+		},
+		{
+			name: "non-matching cluster group excluded",
+			cgs: []*v1alpha1.ClusterGroup{
+				makeCG("prod-cg", "1", &metav1.LabelSelector{
+					MatchLabels: map[string]string{"env": "prod"},
+				}),
+			},
+			clusterLabels: map[string]string{"env": "staging"},
+			expectedNames: []string{},
+		},
+		{
+			name: "nil selector cluster group excluded",
+			cgs: []*v1alpha1.ClusterGroup{
+				makeCG("no-selector-cg", "1", nil),
+			},
+			clusterLabels: map[string]string{"env": "prod"},
+			expectedNames: []string{},
+		},
+		{
+			name: "invalid selector skipped",
+			cgs: []*v1alpha1.ClusterGroup{
+				makeCG("bad-cg", "1", &metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{Key: "env", Operator: "InvalidOp", Values: []string{"prod"}},
+					},
+				}),
+			},
+			clusterLabels: map[string]string{"env": "prod"},
+			expectedNames: []string{},
+		},
+		{
+			name:          "list error propagated",
+			listError:     errors.New("list failed"),
+			clusterLabels: nil,
+			wantError:     true,
+		},
+		{
+			name: "multiple cgs, only matching returned",
+			cgs: []*v1alpha1.ClusterGroup{
+				makeCG("prod-cg", "1", &metav1.LabelSelector{
+					MatchLabels: map[string]string{"env": "prod"},
+				}),
+				makeCG("staging-cg", "1", &metav1.LabelSelector{
+					MatchLabels: map[string]string{"env": "staging"},
+				}),
+			},
+			clusterLabels: map[string]string{"env": "prod"},
+			expectedNames: []string{"prod-cg"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockCGCache := fake.NewMockCacheInterface[*v1alpha1.ClusterGroup](ctrl)
+			mockCGCache.EXPECT().List("fleet-default", gomock.Any()).Return(tc.cgs, tc.listError)
+
+			cluster := &v1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "fleet-default",
+					Labels:    tc.clusterLabels,
+				},
+			}
+
+			manager := newManagerWithClusterGroupCache(t, ctrl, mockCGCache)
+			result, err := manager.clusterGroupsForCluster(cluster)
+
+			if tc.wantError {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+
+			names := make([]string, len(result))
+			for i, cg := range result {
+				names[i] = cg.Name
+			}
+			if len(tc.expectedNames) == 0 {
+				assert.Empty(t, names)
+			} else {
+				assert.Equal(t, tc.expectedNames, names)
+			}
+		})
+	}
+}
+
+func TestClusterGroupsForCluster_SelectorCachedAfterFirstCall(t *testing.T) {
+	// After the first call the selector is stored in selectorCache keyed by
+	// namespace/name@resourceVersion; a second call must find it.
+	ctrl := gomock.NewController(t)
+
+	cg := &v1alpha1.ClusterGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "prod-cg",
+			Namespace:       "fleet-default",
+			ResourceVersion: "42",
+		},
+		Spec: v1alpha1.ClusterGroupSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"env": "prod"},
+			},
+		},
+	}
+
+	cluster := &v1alpha1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cluster",
+			Namespace: "fleet-default",
+			Labels:    map[string]string{"env": "prod"},
+		},
+	}
+
+	mockCGCache := fake.NewMockCacheInterface[*v1alpha1.ClusterGroup](ctrl)
+	// List is called on each clusterGroupsForCluster invocation; selector compilation is cached.
+	mockCGCache.EXPECT().List("fleet-default", gomock.Any()).Return([]*v1alpha1.ClusterGroup{cg}, nil).Times(2)
+
+	manager := newManagerWithClusterGroupCache(t, ctrl, mockCGCache)
+
+	result1, err := manager.clusterGroupsForCluster(cluster)
+	assert.NoError(t, err)
+	assert.Len(t, result1, 1)
+
+	cacheKey := "fleet-default/prod-cg@42"
+	cached, ok := manager.selectorCache.Load(cacheKey)
+	assert.True(t, ok, "selector should be in cache after first call")
+	assert.Implements(t, (*labels.Selector)(nil), cached)
+
+	result2, err := manager.clusterGroupsForCluster(cluster)
+	assert.NoError(t, err)
+	assert.Len(t, result2, 1)
+}
+
+func TestClusterGroupsForCluster_NewResourceVersionGetsNewCacheEntry(t *testing.T) {
+	// When a ClusterGroup is updated (ResourceVersion bumped), a new cache entry is
+	// created so the updated selector is compiled rather than served stale.
+	ctrl := gomock.NewController(t)
+
+	makeCG := func(rv string) *v1alpha1.ClusterGroup {
+		return &v1alpha1.ClusterGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "prod-cg",
+				Namespace:       "fleet-default",
+				ResourceVersion: rv,
+			},
+			Spec: v1alpha1.ClusterGroupSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"env": "prod"},
+				},
+			},
+		}
+	}
+
+	cluster := &v1alpha1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cluster",
+			Namespace: "fleet-default",
+			Labels:    map[string]string{"env": "prod"},
+		},
+	}
+
+	mockCGCache := fake.NewMockCacheInterface[*v1alpha1.ClusterGroup](ctrl)
+	mockCGCache.EXPECT().List("fleet-default", gomock.Any()).Return([]*v1alpha1.ClusterGroup{makeCG("1")}, nil)
+	mockCGCache.EXPECT().List("fleet-default", gomock.Any()).Return([]*v1alpha1.ClusterGroup{makeCG("2")}, nil)
+
+	manager := newManagerWithClusterGroupCache(t, ctrl, mockCGCache)
+
+	_, err := manager.clusterGroupsForCluster(cluster)
+	assert.NoError(t, err)
+
+	_, err = manager.clusterGroupsForCluster(cluster)
+	assert.NoError(t, err)
+
+	_, v1Cached := manager.selectorCache.Load("fleet-default/prod-cg@1")
+	_, v2Cached := manager.selectorCache.Load("fleet-default/prod-cg@2")
+	assert.True(t, v1Cached, "entry for rv=1 should be cached")
+	assert.True(t, v2Cached, "entry for rv=2 should be cached as a new entry")
+}
+
+func TestClusterGroupsForCluster_InvalidSelectorNotCached(t *testing.T) {
+	// A ClusterGroup with an invalid selector must not be stored in the cache.
+	ctrl := gomock.NewController(t)
+
+	cg := &v1alpha1.ClusterGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "bad-cg",
+			Namespace:       "fleet-default",
+			ResourceVersion: "1",
+		},
+		Spec: v1alpha1.ClusterGroupSpec{
+			Selector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "env", Operator: "InvalidOp", Values: []string{"prod"}},
+				},
+			},
+		},
+	}
+
+	cluster := &v1alpha1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cluster",
+			Namespace: "fleet-default",
+			Labels:    map[string]string{"env": "prod"},
+		},
+	}
+
+	mockCGCache := fake.NewMockCacheInterface[*v1alpha1.ClusterGroup](ctrl)
+	mockCGCache.EXPECT().List("fleet-default", gomock.Any()).Return([]*v1alpha1.ClusterGroup{cg}, nil)
+
+	manager := newManagerWithClusterGroupCache(t, ctrl, mockCGCache)
+
+	result, err := manager.clusterGroupsForCluster(cluster)
+	assert.NoError(t, err)
+	assert.Empty(t, result)
+
+	_, cached := manager.selectorCache.Load("fleet-default/bad-cg@1")
+	assert.False(t, cached, "invalid selector must not be stored in cache")
 }
